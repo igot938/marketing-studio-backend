@@ -187,47 +187,45 @@ async def _llm_generate_copy(payload: GenerateScriptIn) -> GenerateScriptOut:
     )
 
 
-async def _muapi_generate_video(job_id: str, payload: GenerateVideoIn) -> None:
-    """
-    Dispara a geração de vídeo na MuAPI (ou em qualquer provider equivalente)
-    e atualiza JOBS[job_id] conforme o progresso.
+# main.py
+import os, asyncio, httpx
 
-    >>> API KEY: usa MUAPI_API_KEY
-    >>> OPEN-GENERATIVE-AI HOOK: para rodar 100% local, troque este bloco por
-        uma chamada aos scripts de difusão image-to-video do repo.
-    """
-    JOBS[job_id]["status"] = "processing"
-    try:
-        if not MUAPI_API_KEY:
-            # Modo simulado — útil para desenvolvimento sem chave
-            await asyncio.sleep(2)
-            JOBS[job_id].update(status="done", preview_url="https://example.com/mock.mp4")
-            return
+MUAPI_BASE = "https://api.muapi.ai/api/v1"
+MUAPI_KEY = os.environ["MUAPI_API_KEY"]
+MUAPI_MODEL = os.getenv("MUAPI_MODEL", "veo3-fast-text-to-video")
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            # NOTE: ajuste endpoint/payload conforme a doc atual da MuAPI.
-            r = await client.post(
-                "https://api.muapi.ai/v1/video/generate",
-                headers={"Authorization": f"Bearer {MUAPI_API_KEY}"},   # >>> API KEY
-                json={
-                    "prompt": payload.prompt,
-                    "style": payload.style,
-                    "product_image": str(payload.product_image_url) if payload.product_image_url else None,
-                    "avatar_image": str(payload.avatar_image_url) if payload.avatar_image_url else None,
-                    "duration": payload.duration_seconds,
-                    "aspect_ratio": payload.aspect_ratio,
-                },
+async def _muapi_generate_video(prompt: str, duration: int = 5, aspect_ratio: str = "9:16") -> str:
+    headers = {"x-api-key": MUAPI_KEY, "Content-Type": "application/json"}
+    payload = {"prompt": prompt, "duration": duration, "aspect_ratio": aspect_ratio}
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # 1) Submit
+        r = await client.post(f"{MUAPI_BASE}/{MUAPI_MODEL}", json=payload, headers=headers)
+        r.raise_for_status()
+        request_id = r.json()["request_id"]
+
+        # 2) Poll (até ~5 min)
+        for _ in range(100):
+            await asyncio.sleep(3)
+            poll = await client.get(
+                f"{MUAPI_BASE}/predictions/{request_id}/result",
+                headers=headers,
             )
-            r.raise_for_status()
-            data = r.json()
-            JOBS[job_id].update(
-                status="done",
-                preview_url=data.get("video_url") or data.get("url"),
-                provider_response=data,
-            )
-    except Exception as exc:  # pragma: no cover
-        log.exception("video generation failed")
-        JOBS[job_id].update(status="failed", error=str(exc))
+            poll.raise_for_status()
+            data = poll.json()
+            status = data.get("status")
+            if status == "completed":
+                outputs = data.get("outputs") or []
+                if not outputs:
+                    raise RuntimeError(f"MuAPI completou sem outputs: {data}")
+                # outputs pode ser lista de strings (URLs) ou de objetos
+                first = outputs[0]
+                return first if isinstance(first, str) else first.get("url") or first.get("video")
+            if status == "failed":
+                raise RuntimeError(f"MuAPI falhou: {data}")
+
+        raise TimeoutError(f"MuAPI demorou demais (request_id={request_id})")
+
 
 
 # ------------------------------------------------------------------ #
